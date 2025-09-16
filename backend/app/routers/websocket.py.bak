@@ -1,0 +1,804 @@
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from sqlalchemy.orm import Session
+import json
+import asyncio
+import logging
+from typing import Dict, Any
+from datetime import datetime, timezone
+
+from ..db import get_db
+from ..auth import get_current_user_websocket
+from ..services.websocket_manager import manager, WebSocketService
+from .. import models
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
+    """Main WebSocket endpoint for real-time communication"""
+    
+    # Accept the connection first
+    await websocket.accept()
+    
+    user_id = None
+    role = None
+    ws_service = WebSocketService(db)
+    
+    try:
+        # Wait for authentication message
+        auth_timeout = asyncio.create_task(asyncio.sleep(30))  # 30 second timeout
+        auth_message = asyncio.create_task(websocket.receive_text())
+        
+        done, pending = await asyncio.wait(
+            {auth_timeout, auth_message}, 
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+        
+        if auth_timeout in done:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "Authentication timeout"
+            }))
+            await websocket.close(code=4001)
+            return
+        
+        # Process authentication
+        auth_data = json.loads(auth_message.result())
+        
+        if auth_data.get("type") != "authenticate":
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "First message must be authentication"
+            }))
+            await websocket.close(code=4002)
+            return
+        
+        # Verify token and get user
+        token = auth_data.get("token")
+        if not token:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "Token required"
+            }))
+            await websocket.close(code=4003)
+            return
+        
+        try:
+            user = await get_current_user_websocket(token, db)
+            user_id = user.id
+            
+            # Get user role
+            if user.role_id:
+                role_obj = db.query(models.Role).get(user.role_id)
+                role = role_obj.name if role_obj else "viewer"
+            else:
+                role = "viewer"
+                
+        except Exception as e:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": "Invalid token"
+            }))
+            await websocket.close(code=4004)
+            return
+        
+        # Register connection
+        await manager.connect(websocket, user_id, role)
+        
+        # Send initial data
+        await send_initial_data(websocket, db, user, role)
+        
+        # Handle incoming messages
+        while True:
+            try:
+                # Set a timeout for receiving messages
+                message_task = asyncio.create_task(websocket.receive_text())
+                timeout_task = asyncio.create_task(asyncio.sleep(300))  # 5 minute timeout
+                
+                done, pending = await asyncio.wait(
+                    {message_task, timeout_task},
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Cancel pending tasks
+                for task in pending:
+                    task.cancel()
+                
+                if timeout_task in done:
+                    # Send ping to check if connection is still alive
+                    await websocket.send_text(json.dumps({
+                        "type": "ping",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }))
+                    continue
+                
+                # Process received message
+                message_text = message_task.result()
+                message_data = json.loads(message_text)
+                
+                # Handle different message types
+                await ws_service.handle_websocket_message(websocket, message_data)
+                
+            except asyncio.CancelledError:
+                break
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Invalid JSON format"
+                }))
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {e}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Internal server error"
+                }))
+                
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for user {user_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        # Clean up connection
+        if websocket in manager.ws_to_user:
+            manager.disconnect(websocket)
+
+async def send_initial_data(websocket: WebSocket, db: Session, user: models.User, role: str):
+    """Send initial data when user connects"""
+    
+    try:
+        # Get latest sensor data
+        latest_sensors = db.query(models.Sensor).filter(
+            models.Sensor.status == 'active'
+        ).limit(20).all()
+        
+        sensor_data = []
+        for sensor in latest_sensors:
+            # Get latest metric for each sensor
+            latest_metric = db.query(models.Metric).filter(
+                models.Metric.sensor_id == sensor.id
+            ).order_by(models.Metric.ts.desc()).first()
+            
+            if latest_metric:
+                sensor_data.append({
+                    "sensor_id": sensor.id,
+                    "sensor_name": sensor.name,
+                    "sensor_type": sensor.sensor_type.name if sensor.sensor_type else "unknown",
+                    "location": {
+                        "lat": sensor.location_lat,
+                        "lng": sensor.location_lng,
+                        "address": sensor.location_address
+                    },
+                    "latest_value": latest_metric.value,
+                    "timestamp": latest_metric.ts.isoformat(),
+                    "status": sensor.status
+                })
+        
+        # Get active alerts (role-based filtering)
+        alerts_query = db.query(models.Alert).filter(
+            models.Alert.status.in_(['active', 'acknowledged'])
+        )
+        
+        # Apply role-based filtering
+        if role == "traffic_control":
+            alerts_query = alerts_query.filter(models.Alert.category == "traffic")
+        elif role == "environment_officer":
+            alerts_query = alerts_query.filter(models.Alert.category == "environment")
+        elif role == "utility_officer":
+            alerts_query = alerts_query.filter(models.Alert.category == "utility")
+        
+        active_alerts = alerts_query.order_by(
+            models.Alert.priority.desc(),
+            models.Alert.created_at.desc()
+        ).limit(10).all()
+        
+        alerts_data = []
+        for alert in active_alerts:
+            alerts_data.append({
+                "id": alert.id,
+                "alert_id": alert.alert_id,
+                "title": alert.title,
+                "message": alert.message,
+                "severity": alert.severity.value,
+                "status": alert.status.value,
+                "category": alert.category,
+                "location": {
+                    "lat": alert.location_lat,
+                    "lng": alert.location_lng,
+                    "address": alert.location_address
+                },
+                "created_at": alert.created_at.isoformat(),
+                "priority": alert.priority
+            })
+        
+        # Get system statistics
+        total_sensors = db.query(models.Sensor).count()
+        active_sensors = db.query(models.Sensor).filter(
+            models.Sensor.status == 'active'
+        ).count()
+        
+        total_alerts = db.query(models.Alert).count()
+        active_alerts_count = db.query(models.Alert).filter(
+            models.Alert.status == 'active'
+        ).count()
+        
+        critical_alerts = db.query(models.Alert).filter(
+            models.Alert.severity == models.SeverityLevel.CRITICAL,
+            models.Alert.status == 'active'
+        ).count()
+        
+        system_stats = {
+            "total_sensors": total_sensors,
+            "active_sensors": active_sensors,
+            "sensor_uptime": (active_sensors / max(total_sensors, 1)) * 100,
+            "total_alerts": total_alerts,
+            "active_alerts": active_alerts_count,
+            "critical_alerts": critical_alerts,
+            "system_health": 95.0,  # Calculate based on various metrics
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Send initial data package
+        await manager.send_personal_message({
+            "type": "initial_data",
+            "data": {
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "role": role
+                },
+                "sensors": sensor_data,
+                "alerts": alerts_data,
+                "system_stats": system_stats,
+                "connection_info": {
+                    "connected_at": datetime.now(timezone.utc).isoformat(),
+                    "role_permissions": get_role_permissions(role)
+                }
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, websocket)
+        
+        # Send role-specific data
+        if role == "admin":
+            # Send additional admin data
+            await send_admin_data(websocket, db)
+        elif role in ["traffic_control", "environment_officer", "utility_officer"]:
+            # Send department-specific data
+            await send_department_data(websocket, db, role)
+            
+    except Exception as e:
+        logger.error(f"Error sending initial data: {e}")
+        await manager.send_personal_message({
+            "type": "error",
+            "message": "Failed to load initial data"
+        }, websocket)
+
+async def send_admin_data(websocket: WebSocket, db: Session):
+    """Send admin-specific data"""
+    
+    try:
+        # Get user activity stats
+        active_users = len(manager.active_connections)
+        connections_by_role = {}
+        
+        for role, connections in manager.role_connections.items():
+            connections_by_role[role] = len(connections)
+        
+        # Get system performance metrics
+        from sqlalchemy import func
+        
+        # Recent metric counts by type
+        recent_metrics = db.query(
+            models.Metric.metric_type,
+            func.count(models.Metric.id).label('count')
+        ).filter(
+            models.Metric.ts >= datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        ).group_by(models.Metric.metric_type).all()
+        
+        metrics_stats = {metric_type: count for metric_type, count in recent_metrics}
+        
+        admin_data = {
+            "active_users": active_users,
+            "connections_by_role": connections_by_role,
+            "daily_metrics": metrics_stats,
+            "system_load": {
+                "cpu": 45.2,  # These would come from actual system monitoring
+                "memory": 62.8,
+                "disk": 34.1,
+                "network": 12.5
+            }
+        }
+        
+        await manager.send_personal_message({
+            "type": "admin_data",
+            "data": admin_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, websocket)
+        
+    except Exception as e:
+        logger.error(f"Error sending admin data: {e}")
+
+async def send_department_data(websocket: WebSocket, db: Session, role: str):
+    """Send department-specific data"""
+    
+    try:
+        department_map = {
+            "traffic_control": "traffic",
+            "environment_officer": "environment", 
+            "utility_officer": "utility"
+        }
+        
+        category = department_map.get(role)
+        if not category:
+            return
+        
+        # Get department-specific sensors
+        dept_sensors = db.query(models.Sensor).join(models.SensorType).filter(
+            models.SensorType.category == category
+        ).all()
+        
+        # Get department-specific recent metrics
+        from sqlalchemy import func
+        
+        recent_metrics = db.query(
+            func.avg(models.Metric.value).label('avg_value'),
+            func.min(models.Metric.value).label('min_value'),
+            func.max(models.Metric.value).label('max_value'),
+            func.count(models.Metric.id).label('count')
+        ).join(models.Sensor).join(models.SensorType).filter(
+            models.SensorType.category == category,
+            models.Metric.ts >= datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        ).first()
+        
+        dept_data = {
+            "department": category,
+            "sensor_count": len(dept_sensors),
+            "active_sensors": len([s for s in dept_sensors if s.status == 'active']),
+            "daily_stats": {
+                "avg_value": float(recent_metrics.avg_value) if recent_metrics.avg_value else 0,
+                "min_value": float(recent_metrics.min_value) if recent_metrics.min_value else 0,
+                "max_value": float(recent_metrics.max_value) if recent_metrics.max_value else 0,
+                "total_readings": recent_metrics.count or 0
+            }
+        }
+        
+        await manager.send_personal_message({
+            "type": "department_data",
+            "data": dept_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }, websocket)
+        
+    except Exception as e:
+        logger.error(f"Error sending department data: {e}")
+
+def get_role_permissions(role: str) -> list:
+    """Get permissions for a specific role"""
+    
+    permissions_map = {
+        "admin": [
+            "view_all", "edit_all", "delete_all", "manage_users", 
+            "manage_sensors", "manage_alerts", "system_config"
+        ],
+        "traffic_control": [
+            "view_traffic", "edit_traffic", "manage_traffic_alerts", "traffic_optimization"
+        ],
+        "environment_officer": [
+            "view_environment", "edit_environment", "manage_env_alerts", "env_monitoring"
+        ],
+        "utility_officer": [
+            "view_utilities", "edit_utilities", "manage_utility_alerts", "utility_optimization"
+        ],
+        "emergency": [
+            "view_all", "emergency_override", "manage_emergency_alerts", "dispatch_response"
+        ],
+        "viewer": [
+            "view_dashboard", "view_alerts"
+        ]
+    }
+    
+    return permissions_map.get(role, ["view_dashboard"])
+
+# Background task to broadcast system updates
+async def broadcast_system_updates():
+    """Background task to periodically broadcast system updates"""
+    
+    while True:
+        try:
+            # Wait 30 seconds between broadcasts
+            await asyncio.sleep(30)
+            
+            # Get database session
+            from ..db import SessionLocal
+            db = SessionLocal()
+            
+            try:
+                # Get current system stats
+                total_sensors = db.query(models.Sensor).count()
+                active_sensors = db.query(models.Sensor).filter(
+                    models.Sensor.status == 'active'
+                ).count()
+                
+                active_alerts = db.query(models.Alert).filter(
+                    models.Alert.status == 'active'
+                ).count()
+                
+                # Broadcast system health update
+                health_update = {
+                    "type": "system_health_update",
+                    "data": {
+                        "total_sensors": total_sensors,
+                        "active_sensors": active_sensors,
+                        "sensor_uptime": (active_sensors / max(total_sensors, 1)) * 100,
+                        "active_alerts": active_alerts,
+                        "system_load": {
+                            "cpu": 45.2,  # Mock data - replace with actual monitoring
+                            "memory": 62.8,
+                            "network": 12.5
+                        },
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                }
+                
+                await manager.broadcast(health_update)
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Error in system updates broadcast: {e}")
+            await asyncio.sleep(60)  # Wait longer on error
+
+# Start background tasks when module is imported
+def start_background_tasks():
+    """Start background tasks for WebSocket service"""
+    loop = asyncio.get_event_loop()
+    loop.create_task(broadcast_system_updates())
+
+# Connection statistics endpoint
+@router.get("/stats")
+async def get_connection_stats():
+    """Get current WebSocket connection statistics"""
+    
+    stats = manager.get_connection_stats()
+    
+    return {
+        "success": True,
+        "data": {
+            **stats,
+            "uptime": "24h 15m",  # Would be calculated from server start time
+            "last_updated": datetime.now(timezone.utc).isoformat()
+        }
+    }
+
+# Broadcast message endpoint (admin only)
+@router.post("/broadcast")
+async def broadcast_message(
+    message: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Broadcast a message to all connected clients (admin only)"""
+    
+    # Check if user is admin
+    if current_user.role_id:
+        role = db.query(models.Role).get(current_user.role_id)
+        if not role or role.name != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+    else:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Add metadata to message
+    broadcast_data = {
+        "type": "admin_broadcast",
+        "data": message,
+        "metadata": {
+            "sent_by": {
+                "id": current_user.id,
+                "username": current_user.username,
+                "name": f"{current_user.first_name} {current_user.last_name}"
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    }
+    
+    # Broadcast to all connected clients
+    await manager.broadcast(broadcast_data)
+    
+    return {
+        "success": True,
+        "message": "Broadcast sent successfully",
+        "recipients": sum(len(connections) for connections in manager.active_connections.values())
+    }
+
+# Send message to specific role
+@router.post("/broadcast/role/{role_name}")
+async def broadcast_to_role(
+    role_name: str,
+    message: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Broadcast a message to all users of a specific role"""
+    
+    # Check permissions (admin or same role for department-specific messages)
+    user_role = None
+    if current_user.role_id:
+        user_role_obj = db.query(models.Role).get(current_user.role_id)
+        user_role = user_role_obj.name if user_role_obj else None
+    
+    if user_role != "admin" and user_role != role_name:
+        raise HTTPException(
+            status_code=403, 
+            detail="Insufficient permissions to broadcast to this role"
+        )
+    
+    # Verify target role exists
+    target_role = db.query(models.Role).filter(models.Role.name == role_name).first()
+    if not target_role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    # Add metadata to message
+    broadcast_data = {
+        "type": "role_broadcast",
+        "target_role": role_name,
+        "data": message,
+        "metadata": {
+            "sent_by": {
+                "id": current_user.id,
+                "username": current_user.username,
+                "role": user_role
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    }
+    
+    # Broadcast to specific role
+    await manager.send_to_role(broadcast_data, role_name)
+    
+    recipient_count = len(manager.role_connections.get(role_name, set()))
+    
+    return {
+        "success": True,
+        "message": f"Broadcast sent to {role_name} role",
+        "recipients": recipient_count
+    }
+
+# Emergency broadcast endpoint
+@router.post("/emergency-broadcast")
+async def emergency_broadcast(
+    title: str,
+    message: str,
+    severity: str = "critical",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Send emergency broadcast to all users"""
+    
+    # Check if user has emergency permissions
+    if current_user.role_id:
+        role = db.query(models.Role).get(current_user.role_id)
+        if not role or role.name not in ["admin", "emergency"]:
+            raise HTTPException(
+                status_code=403, 
+                detail="Emergency broadcast permissions required"
+            )
+    else:
+        raise HTTPException(status_code=403, detail="Emergency permissions required")
+    
+    # Create emergency alert in database
+    emergency_alert = models.Alert(
+        alert_id=f"EMERGENCY-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        sensor_id=1,  # Use a default sensor or create a system sensor
+        metric_type="emergency_broadcast",
+        severity=models.SeverityLevel.CRITICAL,
+        status=models.AlertStatus.ACTIVE,
+        title=title,
+        message=message,
+        category="emergency",
+        priority=4,
+        assigned_to_id=current_user.id
+    )
+    
+    db.add(emergency_alert)
+    db.commit()
+    db.refresh(emergency_alert)
+    
+    # Prepare emergency broadcast data
+    emergency_data = {
+        "type": "emergency_broadcast",
+        "alert": {
+            "id": emergency_alert.id,
+            "alert_id": emergency_alert.alert_id,
+            "title": title,
+            "message": message,
+            "severity": severity,
+            "created_at": emergency_alert.created_at.isoformat()
+        },
+        "metadata": {
+            "sent_by": {
+                "id": current_user.id,
+                "username": current_user.username,
+                "name": f"{current_user.first_name} {current_user.last_name}"
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    }
+    
+    # Broadcast emergency alert to all connected clients
+    await manager.broadcast(emergency_data)
+    
+    # Log emergency broadcast
+    logger.critical(f"Emergency broadcast sent by {current_user.username}: {title}")
+    
+    return {
+        "success": True,
+        "message": "Emergency broadcast sent",
+        "alert_id": emergency_alert.alert_id,
+        "recipients": sum(len(connections) for connections in manager.active_connections.values())
+    }
+
+# Test connection endpoint
+@router.post("/test-connection")
+async def test_websocket_connection():
+    """Test WebSocket connectivity"""
+    
+    test_message = {
+        "type": "connection_test",
+        "message": "WebSocket connection test",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Broadcast test message
+    await manager.broadcast(test_message)
+    
+    return {
+        "success": True,
+        "message": "Test message sent",
+        "active_connections": len(manager.active_connections)
+    }
+
+# Get active users endpoint
+@router.get("/active-users")
+async def get_active_users(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Get list of currently active users"""
+    
+    # Check if user has permission to view active users
+    if current_user.role_id:
+        role = db.query(models.Role).get(current_user.role_id)
+        if not role or role.name not in ["admin", "emergency"]:
+            raise HTTPException(
+                status_code=403, 
+                detail="Insufficient permissions"
+            )
+    else:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
+    active_users = []
+    
+    for user_id, connections in manager.active_connections.items():
+        user = db.query(models.User).get(user_id)
+        if user:
+            user_role = None
+            if user.role_id:
+                role_obj = db.query(models.Role).get(user.role_id)
+                user_role = role_obj.name if role_obj else None
+            
+            active_users.append({
+                "id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "role": user_role,
+                "connection_count": len(connections),
+                "last_login": user.last_login.isoformat() if user.last_login else None
+            })
+    
+    return {
+        "success": True,
+        "data": {
+            "active_users": active_users,
+            "total_connections": sum(len(connections) for connections in manager.active_connections.values()),
+            "total_users": len(active_users)
+        }
+    }
+
+# Send notification to specific user
+@router.post("/notify/{user_id}")
+async def send_user_notification(
+    user_id: int,
+    title: str,
+    message: str,
+    notification_type: str = "info",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Send notification to a specific user"""
+    
+    # Check if target user exists
+    target_user = db.query(models.User).get(user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check permissions (admin can notify anyone, users can notify within their department)
+    user_role = None
+    if current_user.role_id:
+        role_obj = db.query(models.Role).get(current_user.role_id)
+        user_role = role_obj.name if role_obj else None
+    
+    if user_role != "admin":
+        # Allow users to notify within their department or themselves
+        if current_user.id != user_id and current_user.role_id != target_user.role_id:
+            raise HTTPException(
+                status_code=403, 
+                detail="Insufficient permissions to notify this user"
+            )
+    
+    # Create notification in database
+    notification = models.Notification(
+        user_id=user_id,
+        type=notification_type,
+        title=title,
+        message=message,
+        data={
+            "sent_by": current_user.id,
+            "sent_by_username": current_user.username
+        }
+    )
+    
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+    
+    # Send real-time notification if user is connected
+    if user_id in manager.active_connections:
+        notification_data = {
+            "type": "user_notification",
+            "notification": {
+                "id": notification.id,
+                "title": title,
+                "message": message,
+                "type": notification_type,
+                "created_at": notification.created_at.isoformat()
+            },
+            "metadata": {
+                "sent_by": {
+                    "id": current_user.id,
+                    "username": current_user.username
+                }
+            }
+        }
+        
+        await manager.send_to_user(notification_data, user_id)
+        delivered = True
+    else:
+        delivered = False
+    
+    return {
+        "success": True,
+        "message": "Notification sent",
+        "notification_id": notification.id,
+        "delivered_realtime": delivered
+    }
+
+# Health check for WebSocket service
+@router.get("/health")
+async def websocket_health_check():
+    """Health check for WebSocket service"""
+    
+    stats = manager.get_connection_stats()
+    
+    return {
+        "status": "healthy",
+        "service": "websocket",
+        "connections": stats,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
